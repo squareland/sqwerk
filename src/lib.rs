@@ -57,10 +57,18 @@ pub enum RecvError {
     ChannelClosed,
 }
 
-#[derive(Clone)]
 pub struct PacketSender<'a, P> {
     channel: Se<'a>,
     _ty: PhantomData<P>
+}
+
+impl<'a, P> Clone for PacketSender<'a, P> {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            _ty: PhantomData
+        }
+    }
 }
 
 impl<'a, P> PacketSender<'a, P> where P: Serialize + Debug + Send {
