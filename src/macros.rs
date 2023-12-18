@@ -38,7 +38,9 @@ macro_rules! packet {
 
             $vis trait [<$ty_name Handler>] {
                 $(
-                    fn [<handle_ $name:snake>] (&mut self, packet: $name);
+                    fn [<handle_ $name:snake>] (&mut self, packet: $name) {
+                        //NOOP
+                    }
                 )*
             }
         }
