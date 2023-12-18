@@ -252,7 +252,6 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                 let _ = callback.send(Connection::Reconnecting);
                 match fastwebsockets::handshake::connect(&request).await {
                     Err(e) => {
-                        //Timeout
                         if reconnect_timeout.check_expired().await {
                             break e;
                         }
@@ -261,7 +260,6 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                         let (rx, tx) = ws.split(|s| tokio::io::split(s));
                         reconnect_timeout.reset();
                         let worker = create_workers(rx, tx, reconnect);
-                        println!("Reconnect successful");
                         let _ = callback.send(Connection::Established);
                         reconnect = worker.await;
                     }
