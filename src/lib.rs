@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::net::TcpListener;
+use tokio::time::interval;
 
 use hyper::{HeaderMap, Request, Response};
 use hyper::body::{Bytes, Incoming};
@@ -66,14 +67,14 @@ pub enum RecvError {
 
 pub struct PacketSender<'a, P> {
     channel: Se<'a>,
-    _ty: PhantomData<P>
+    _ty: PhantomData<P>,
 }
 
 impl<'a, P> Clone for PacketSender<'a, P> {
     fn clone(&self) -> Self {
         Self {
             channel: self.channel.clone(),
-            _ty: PhantomData
+            _ty: PhantomData,
         }
     }
 }
@@ -98,7 +99,7 @@ impl<'a, P> PacketSender<'a, P> where P: Serialize + Debug + Send {
 pub struct PacketReceiver<'a, P> {
     channel: Re<'a>,
     closed: bool,
-    _ty: PhantomData<P>
+    _ty: PhantomData<P>,
 }
 
 impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
@@ -163,34 +164,41 @@ fn get_peer_ip(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
 fn get_peer_token(headers: &HeaderMap) -> Result<u128, WebSocketError> {
     if let Some(header) = headers.get("sec-websocket-key") {
         if let Ok(s) = std::str::from_utf8(header.as_ref()) {
-            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
-                if raw.len() == 16 {
-                    let mut token = [0; 16];
-                    token.copy_from_slice(&raw);
-                    return Ok(u128::from_le_bytes(token));
-                }
-            }
+            return decode_token(s);
         }
     }
     Err(WebSocketError::MissingSecWebSocketKey)
+}
+
+const TOKEN_LENGTH: usize = 16;
+fn decode_token(s: &str) -> Result<u128, WebSocketError> {
+    if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
+        if raw.len() == TOKEN_LENGTH {
+            let mut token = [0; TOKEN_LENGTH];
+            token.copy_from_slice(&raw);
+            return Ok(u128::from_le_bytes(token));
+        }
+    }
+    Err(WebSocketError::InvalidValue)
 }
 
 pub struct Peer<'a, P> {
     pub ip: IpAddr,
     pub token: u128,
     pub rx: PacketReceiver<'a, P>,
-    pub tx: PacketSender<'a, P>
+    pub tx: PacketSender<'a, P>,
 }
 
 pub enum Connection {
-    Established,
-    Reconnecting
+    Established(bool), // is primary
+    Reconnecting,
+    Disconnected,
 }
 
 async fn upgrade<'a, P>(
     mut req: Request<Incoming>,
     peer: SocketAddr,
-    callback: UnboundedSender<Peer<'static, P>>
+    callback: UnboundedSender<Peer<'static, P>>,
 ) -> Result<Response<Empty<Bytes>>, WebSocketError>
     where
         P: Send + 'static
@@ -204,7 +212,10 @@ async fn upgrade<'a, P>(
         let ws = fut.await.expect("fail");
         let (rx, tx, worker) = split::<_, P>(ws);
         callback.send(Peer {
-            ip, token, rx, tx
+            ip,
+            token,
+            rx,
+            tx,
         }).unwrap();
         worker.await;
     });
@@ -233,7 +244,6 @@ pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'stati
             eprintln!("An error occurred: {:?}", e);
         }
     }
-
 }
 
 pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
@@ -243,16 +253,18 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
         let (rx, tx) = ws.split(|s| tokio::io::split(s));
         let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx);
 
+        let _ = callback.send(Connection::Established(true));
+
         let worker = async move {
-            let _ = callback.send(Connection::Established);
             let mut reconnect = worker.await;
-            let mut reconnect_timeout = TimedInterval::from(tokio::time::interval(reconnect_in), max_tries);
+            let mut reconnect_timeout = TimedInterval::from(interval(reconnect_in), max_tries);
 
             loop {
                 let _ = callback.send(Connection::Reconnecting);
                 match fastwebsockets::handshake::connect(&request).await {
                     Err(e) => {
                         if reconnect_timeout.check_expired().await {
+                            let _ = callback.send(Connection::Disconnected);
                             break e;
                         }
                     }
@@ -260,7 +272,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                         let (rx, tx) = ws.split(|s| tokio::io::split(s));
                         reconnect_timeout.reset();
                         let worker = create_workers(rx, tx, reconnect);
-                        let _ = callback.send(Connection::Established);
+                        let _ = callback.send(Connection::Established(false));
                         reconnect = worker.await;
                     }
                 }
