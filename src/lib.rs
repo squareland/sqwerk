@@ -171,6 +171,7 @@ fn get_peer_token(headers: &HeaderMap) -> Result<u128, WebSocketError> {
 }
 
 const TOKEN_LENGTH: usize = 16;
+
 fn decode_token(s: &str) -> Result<u128, WebSocketError> {
     if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
         if raw.len() == TOKEN_LENGTH {
@@ -190,7 +191,8 @@ pub struct Peer<'a, P> {
 }
 
 pub enum Connection {
-    Established(bool), // is primary
+    Established(bool),
+    // is primary
     Reconnecting,
     Disconnected,
 }
@@ -298,27 +300,18 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'a>) -> Re<'a>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
     loop {
-        match out_r.recv().await {
-            Some(command) => {
-                match command {
-                    Ok(frame) => {
-                        if let Err(e) = tx.write_frame(frame).await {
-                            eprintln!("Send error: {:?}", e);
-                            break out_r;
-                        }
-                    }
-                    Err(_) => {
-                        break out_r;
-                    }
+        if let Some(command) = out_r.recv().await {
+            if let Ok(frame) = command {
+                if let Err(e) = tx.write_frame(frame).await {
+                    eprintln!("Send error: {:?}", e);
+                    break out_r;
                 }
             }
-            None => {
-                eprintln!("Packet outbound channel closed");
-                break out_r;
-            }
         }
+        break out_r;
     }
 }
+
 
 async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'a>) -> (Se<'a>, Se<'a>)
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
