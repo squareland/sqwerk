@@ -17,7 +17,7 @@ macro_rules! packet {
             )*
         }
 
-        crate::macros::paste! {
+        $crate::macros::paste! {
             impl $ty_name {
                 $vis fn handle_by<H>(self, handler: &mut H) where H: [<$ty_name Handler>] {
                     match self {
