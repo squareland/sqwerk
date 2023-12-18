@@ -27,6 +27,7 @@ use hyper::service::service_fn;
 pub use tokio;
 pub use hyper;
 pub use bincode;
+pub use fastwebsockets as ws;
 
 pub mod http;
 pub mod macros;
@@ -241,8 +242,7 @@ pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'stati
             .serve_connection(io, service_fn(move |req| upgrade(req, peer, callback.clone())))
             .with_upgrades();
 
-        let r = fut.await;
-        if let Err(e) = r {
+        if let Err(e) = fut.await {
             eprintln!("An error occurred: {:?}", e);
         }
     }
