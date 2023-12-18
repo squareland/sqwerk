@@ -44,8 +44,8 @@ type Tx<T> = WebSocketWrite<WriteHalf<T>>;
 
 pub struct Reconnect<'a> {
     in_s: Se<'a>,
-    out_r: Re<'a>,
-    out_s: Se<'a>,
+    out_r: Re<'static>,
+    out_s: Se<'static>,
 }
 
 #[derive(Error, Debug)]
@@ -66,12 +66,12 @@ pub enum RecvError {
     WebSocket(#[from] WebSocketError),
 }
 
-pub struct PacketSender<'a, P> {
-    channel: Se<'a>,
+pub struct PacketSender<P> {
+    channel: Se<'static>,
     _ty: PhantomData<P>,
 }
 
-impl<'a, P> Clone for PacketSender<'a, P> {
+impl<P> Clone for PacketSender<P> {
     fn clone(&self) -> Self {
         Self {
             channel: self.channel.clone(),
@@ -80,7 +80,7 @@ impl<'a, P> Clone for PacketSender<'a, P> {
     }
 }
 
-impl<'a, P> PacketSender<'a, P> where P: Serialize + Debug + Send {
+impl<P> PacketSender<P> where P: Serialize + Debug + Send {
     pub fn ping(&self) -> Result<(), SendError> {
         self.channel.send(Ok(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))).map_err(|_| SendError::ChannelClosed)
     }
@@ -188,7 +188,7 @@ pub struct Peer<'a, P> {
     pub ip: IpAddr,
     pub token: u128,
     pub rx: PacketReceiver<'a, P>,
-    pub tx: PacketSender<'a, P>,
+    pub tx: PacketSender<P>,
 }
 
 pub enum Connection {
@@ -296,7 +296,7 @@ pub async fn create_workers<'a, T>(rx: Rx<T>, tx: Tx<T>, Reconnect { in_s, out_r
     Reconnect { in_s, out_r, out_s }
 }
 
-async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'a>) -> Re<'a>
+async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
     loop {
@@ -313,7 +313,7 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'a>) -> Re<'a>
 }
 
 
-async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'a>) -> (Se<'a>, Se<'a>)
+async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>, Se<'static>)
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
     let mut rx = FragmentCollectorRead::new(rx);
@@ -343,7 +343,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'a>) -> (Se<'a>, Se<'
     }
 }
 
-pub fn split<'a, T, P>(ws: WebSocket<T>) -> (PacketReceiver<'a, P>, PacketSender<'a, P>, impl Future<Output=Reconnect<'a>> + 'a)
+pub fn split<'a, T, P>(ws: WebSocket<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
@@ -351,11 +351,11 @@ pub fn split<'a, T, P>(ws: WebSocket<T>) -> (PacketReceiver<'a, P>, PacketSender
     create_channels(rx, tx)
 }
 
-pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>, PacketSender<'a, P>, impl Future<Output=Reconnect<'a>> + 'a)
+pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
-    let (out_s, out_r) = unbounded_channel::<Result<Frame<'a>, WebSocketError>>();
+    let (out_s, out_r) = unbounded_channel::<Result<Frame<'static>, WebSocketError>>();
     let (in_s, in_r) = unbounded_channel::<Result<Frame<'a>, WebSocketError>>();
 
     let recv = PacketReceiver {
