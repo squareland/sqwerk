@@ -1,3 +1,5 @@
+pub use paste::paste;
+
 #[macro_export]
 macro_rules! packet {
     ($vis: vis enum $ty_name: ident { $($name:ident {$($field:ident : $ty: ty),*} ),* }) => {
@@ -15,7 +17,7 @@ macro_rules! packet {
             )*
         }
 
-        paste::paste! {
+        crate::macros::paste! {
             impl $ty_name {
                 $vis fn handle_by<H>(self, handler: &mut H) where H: [<$ty_name Handler>] {
                     match self {
