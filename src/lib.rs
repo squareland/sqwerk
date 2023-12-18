@@ -1,19 +1,27 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
+
+use base64::Engine;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketError, WebSocketRead, WebSocketWrite};
+use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, TokioIo, WebSocket, WebSocketError, WebSocketRead, WebSocketWrite};
+use fastwebsockets::body::Empty;
 
 use thiserror::Error;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::time::Interval;
+use tokio::net::TcpListener;
+
+use hyper::{HeaderMap, Request, Response};
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
 
 pub use tokio;
 pub use hyper;
@@ -21,16 +29,13 @@ pub use bincode;
 
 pub mod http;
 pub mod macros;
+mod interval;
 
 use http::ConnectionRequest;
+use interval::TimedInterval;
 
-enum FlowCommand<'a> {
-    Frame(Frame<'a>),
-    Drop,
-}
-
-type Re<'a> = UnboundedReceiver<FlowCommand<'a>>;
-type Se<'a> = UnboundedSender<FlowCommand<'a>>;
+type Re<'a> = UnboundedReceiver<Result<Frame<'a>, WebSocketError>>;
+type Se<'a> = UnboundedSender<Result<Frame<'a>, WebSocketError>>;
 
 type Rx<T> = WebSocketRead<ReadHalf<T>>;
 type Tx<T> = WebSocketWrite<WriteHalf<T>>;
@@ -55,6 +60,8 @@ pub enum RecvError {
     Deserialize(#[from] bincode::Error),
     #[error("channel closed")]
     ChannelClosed,
+    #[error("websocket error")]
+    WebSocket(#[from] WebSocketError),
 }
 
 pub struct PacketSender<'a, P> {
@@ -73,18 +80,18 @@ impl<'a, P> Clone for PacketSender<'a, P> {
 
 impl<'a, P> PacketSender<'a, P> where P: Serialize + Debug + Send {
     pub fn ping(&self) -> Result<(), SendError> {
-        self.channel.send(FlowCommand::Frame(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))).map_err(|_| SendError::ChannelClosed)
     }
 
     pub fn send(&self, msg: &P) -> Result<(), SendError> {
         let serialized = bincode::serialize(msg)?;
         let payload = Payload::Owned(serialized);
-        self.channel.send(FlowCommand::Frame(Frame::binary(payload))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::binary(payload))).map_err(|_| SendError::ChannelClosed)
     }
 
     pub fn close(&self, code: u16, msg: &P) -> Result<(), SendError> {
         let serialized = bincode::serialize(msg)?;
-        self.channel.send(FlowCommand::Frame(Frame::close(code, &serialized))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::close(code, &serialized))).map_err(|_| SendError::ChannelClosed)
     }
 }
 
@@ -103,8 +110,8 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
         if self.closed {
             return Err(RecvError::ChannelClosed);
         }
-        if let Some(command) = self.channel.recv().await {
-            self.process_command(command)
+        if let Some(result) = self.channel.recv().await {
+            self.process(result)
         } else {
             Ok(None)
         }
@@ -116,16 +123,16 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
         }
         match self.channel.try_recv() {
             Ok(command) => {
-                self.process_command(command)
+                self.process(command)
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(RecvError::ChannelClosed)
         }
     }
 
-    fn process_command(&mut self, command: FlowCommand) -> Result<Option<P>, RecvError> {
-        match command {
-            FlowCommand::Frame(frame) => {
+    fn process(&mut self, result: Result<Frame<'a>, WebSocketError>) -> Result<Option<P>, RecvError> {
+        match result {
+            Ok(frame) => {
                 Ok(match frame.opcode {
                     OpCode::Text | OpCode::Binary | OpCode::Close => {
                         let message = bincode::deserialize::<P>(&*frame.payload)?;
@@ -137,34 +144,99 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
                     _ => None
                 })
             }
-            FlowCommand::Drop => Err(RecvError::ChannelClosed)
+            Err(e) => Err(RecvError::WebSocket(e))
         }
     }
 }
 
-struct TimedInterval {
-    interval: Interval,
-    times: u32,
-    current_time: u32,
+fn get_peer_ip(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
+    if let Some(header) = headers.get("x-real-ip") {
+        if let Ok(s) = std::str::from_utf8(header.as_ref()) {
+            if let Ok(ip) = s.parse::<IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    fallback
 }
 
-impl TimedInterval {
-    fn from(interval: Interval, times: u32) -> Self {
-        Self { interval, times, current_time: times }
+fn get_peer_token(headers: &HeaderMap) -> Result<u128, WebSocketError> {
+    if let Some(header) = headers.get("sec-websocket-key") {
+        if let Ok(s) = std::str::from_utf8(header.as_ref()) {
+            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
+                if raw.len() == 16 {
+                    let mut token = [0; 16];
+                    token.copy_from_slice(&raw);
+                    return Ok(u128::from_le_bytes(token));
+                }
+            }
+        }
     }
-
-    async fn check_expired(&mut self) -> bool {
-        self.interval.tick().await;
-        self.current_time -= 1;
-        self.current_time == 0
-    }
-
-    fn reset(&mut self) {
-        self.current_time = self.times;
-    }
+    Err(WebSocketError::MissingSecWebSocketKey)
 }
 
-pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration) -> Result<(PacketReceiver<P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
+pub struct Peer<'a, P> {
+    pub ip: IpAddr,
+    pub token: u128,
+    pub rx: PacketReceiver<'a, P>,
+    pub tx: PacketSender<'a, P>
+}
+
+pub enum Connection {
+    Established,
+    Reconnecting
+}
+
+async fn upgrade<'a, P>(
+    mut req: Request<Incoming>,
+    peer: SocketAddr,
+    callback: UnboundedSender<Peer<'static, P>>
+) -> Result<Response<Empty<Bytes>>, WebSocketError>
+    where
+        P: Send + 'static
+{
+    let headers = req.headers();
+    let ip = get_peer_ip(headers, peer.ip());
+    let token = get_peer_token(headers)?;
+    let (response, fut) = fastwebsockets::upgrade::upgrade(&mut req)?;
+
+    tokio::spawn(async move {
+        let ws = fut.await.expect("fail");
+        let (rx, tx, worker) = split::<_, P>(ws);
+        callback.send(Peer {
+            ip, token, rx, tx
+        }).unwrap();
+        worker.await;
+    });
+
+    Ok(response)
+}
+
+pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'static, P>>)
+    where
+        P: Send + 'static
+{
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let listener = TcpListener::bind(&address).await.expect("Failed to bind to port");
+
+    loop {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let callback = callback.clone();
+
+        let io = TokioIo::new(stream);
+        let fut = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service_fn(move |req| upgrade(req, peer, callback.clone())))
+            .with_upgrades();
+
+        let r = fut.await;
+        if let Err(e) = r {
+            eprintln!("An error occurred: {:?}", e);
+        }
+    }
+
+}
+
+pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
     let request = ConnectionRequest::new(url);
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
@@ -172,11 +244,12 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
         let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx);
 
         let worker = async move {
+            let _ = callback.send(Connection::Established);
             let mut reconnect = worker.await;
             let mut reconnect_timeout = TimedInterval::from(tokio::time::interval(reconnect_in), max_tries);
 
             loop {
-                println!("Trying to reconnect...");
+                let _ = callback.send(Connection::Reconnecting);
                 match fastwebsockets::handshake::connect(&request).await {
                     Err(e) => {
                         //Timeout
@@ -189,6 +262,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                         reconnect_timeout.reset();
                         let worker = create_workers(rx, tx, reconnect);
                         println!("Reconnect successful");
+                        let _ = callback.send(Connection::Established);
                         reconnect = worker.await;
                     }
                 }
@@ -217,13 +291,13 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'a>) -> Re<'a>
         match out_r.recv().await {
             Some(command) => {
                 match command {
-                    FlowCommand::Frame(frame) => {
+                    Ok(frame) => {
                         if let Err(e) = tx.write_frame(frame).await {
                             eprintln!("Send error: {:?}", e);
                             break out_r;
                         }
                     }
-                    FlowCommand::Drop => {
+                    Err(_) => {
                         break out_r;
                     }
                 }
@@ -242,7 +316,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'a>) -> (Se<'a>, Se<'
     let mut rx = FragmentCollectorRead::new(rx);
 
     let mut obligated_send = |f| async {
-        if let Err(_) = out_s.send(FlowCommand::Frame(f)) {
+        if let Err(_) = out_s.send(Ok(f)) {
             Err(SendError::ChannelClosed)
         } else {
             Ok(())
@@ -252,14 +326,14 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'a>) -> (Se<'a>, Se<'
     loop {
         match rx.read_frame(&mut obligated_send).await {
             Ok(frame) => {
-                if let Err(_) = in_s.send(FlowCommand::Frame(frame)) {
+                if let Err(_) = in_s.send(Ok(frame)) {
                     eprintln!("Packet inbound channel closed");
                     break (in_s, out_s);
                 }
             }
             Err(e) => {
                 eprintln!("Recv error: {:?}", e);
-                out_s.send(FlowCommand::Drop).unwrap();
+                out_s.send(Err(e)).unwrap();
                 break (in_s, out_s);
             }
         }
@@ -278,8 +352,8 @@ pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
-    let (out_s, out_r) = unbounded_channel::<FlowCommand<'_>>();
-    let (in_s, in_r) = unbounded_channel::<FlowCommand<'_>>();
+    let (out_s, out_r) = unbounded_channel::<Result<Frame<'a>, WebSocketError>>();
+    let (in_s, in_r) = unbounded_channel::<Result<Frame<'a>, WebSocketError>>();
 
     let recv = PacketReceiver {
         channel: in_r,

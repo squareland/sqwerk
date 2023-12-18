@@ -1,10 +1,8 @@
-use std::convert::Infallible;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use base64::Engine;
+use fastwebsockets::body::Empty;
 use fastwebsockets::handshake::IntoClientRequest;
 use fastwebsockets::WebSocketError;
-use hyper::body::{Body, Bytes, SizeHint};
+use hyper::body::Bytes;
 use hyper::{Request, Uri};
 
 pub struct ConnectionRequest {
@@ -21,27 +19,8 @@ impl ConnectionRequest {
     }
 }
 
-pub struct EmptyBody;
-
-impl Body for EmptyBody {
-    type Data = Bytes;
-    type Error = Infallible;
-
-    fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        Poll::Ready(None)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        true
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(0)
-    }
-}
-
-impl<'a> IntoClientRequest<EmptyBody> for &'a ConnectionRequest {
-    fn into_client_request(self) -> Result<Request<EmptyBody>, WebSocketError> {
+impl<'a> IntoClientRequest<Empty<Bytes>> for &'a ConnectionRequest {
+    fn into_client_request(self) -> Result<Request<Empty<Bytes>>, WebSocketError> {
         let uri = self.url
             .parse::<Uri>()
             .map_err(|_| WebSocketError::InvalidUri)?;
@@ -62,9 +41,9 @@ impl<'a> IntoClientRequest<EmptyBody> for &'a ConnectionRequest {
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", base64::engine::general_purpose::STANDARD.encode(self.token.to_ne_bytes()))
+            .header("Sec-WebSocket-Key", base64::engine::general_purpose::STANDARD.encode(self.token.to_le_bytes()))
             .uri(uri)
-            .body(EmptyBody)?;
+            .body(Empty::<Bytes>::new())?;
 
         Ok(req)
     }
