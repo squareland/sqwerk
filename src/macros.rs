@@ -22,7 +22,7 @@ macro_rules! packet {
                 $vis fn handle_by<H>(self, handler: &mut H) where H: [<$ty_name Handler>] {
                     match self {
                         $(
-                            Self :: $name($name) => handler.[<handle_ $name:snake>] ($name)
+                            Self :: $name(v) => handler.[<handle_ $name:snake>] (v)
                         ),*
                     }
                 }
