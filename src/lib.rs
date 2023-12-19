@@ -209,11 +209,12 @@ async fn upgrade<'a, P>(
     let headers = req.headers();
     let ip = get_peer_ip(headers, peer.ip());
     let token = get_peer_token(headers)?;
-    let (response, fut) = fastwebsockets::upgrade::upgrade(&mut req)?;
+    let (response, upgrade) = fastwebsockets::upgrade::upgrade(&mut req)?;
 
     tokio::spawn(async move {
-        let ws = fut.await.expect("fail");
-        let (rx, tx, worker) = split::<_, P>(ws);
+        let ws = upgrade.await.expect("fail");
+        let (rx, tx) = ws.split(tokio::io::split);
+        let (rx, tx, worker) = create_channels(rx, tx);
         callback.send(Peer {
             ip,
             token,
@@ -252,7 +253,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
     let request = ConnectionRequest::new(url);
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
-        let (rx, tx) = ws.split(|s| tokio::io::split(s));
+        let (rx, tx) = ws.split(tokio::io::split);
         let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx);
 
         let _ = callback.send(Connection::Established(true));
@@ -271,7 +272,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                         }
                     }
                     Ok(ws) => {
-                        let (rx, tx) = ws.split(|s| tokio::io::split(s));
+                        let (rx, tx) = ws.split(tokio::io::split);
                         reconnect_timeout.reset();
                         let worker = create_workers(rx, tx, reconnect);
                         let _ = callback.send(Connection::Established(false));
@@ -304,7 +305,8 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
             if let Ok(frame) = command {
                 if let Err(e) = tx.write_frame(frame).await {
                     eprintln!("Send error: {:?}", e);
-                    break out_r;
+                } else {
+                    continue;
                 }
             }
         }
@@ -341,14 +343,6 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
             }
         }
     }
-}
-
-pub fn split<'a, T, P>(ws: WebSocket<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
-    where
-        T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
-{
-    let (rx, tx) = ws.split(|s| tokio::io::split(s));
-    create_channels(rx, tx)
 }
 
 pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
