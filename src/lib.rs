@@ -28,9 +28,11 @@ pub use tokio;
 pub use hyper;
 pub use bincode;
 pub use fastwebsockets as ws;
+pub use response_channel as chan;
 
 pub mod http;
 pub mod macros;
+pub mod rpc;
 mod interval;
 
 use http::ConnectionRequest;
@@ -184,11 +186,11 @@ fn decode_token(s: &str) -> Result<u128, WebSocketError> {
     Err(WebSocketError::InvalidValue)
 }
 
-pub struct Peer<'a, P> {
+pub struct Peer<'a, M, R> {
     pub ip: IpAddr,
     pub token: u128,
-    pub rx: PacketReceiver<'a, P>,
-    pub tx: PacketSender<P>,
+    pub rx: PacketReceiver<'a, R>,
+    pub tx: PacketSender<M>,
 }
 
 pub enum Connection {
@@ -198,13 +200,14 @@ pub enum Connection {
     Disconnected,
 }
 
-async fn upgrade<'a, P>(
+async fn upgrade<'a, M, R>(
     mut req: Request<Incoming>,
     peer: SocketAddr,
-    callback: UnboundedSender<Peer<'static, P>>,
+    callback: UnboundedSender<Peer<'static, M, R>>,
 ) -> Result<Response<Empty<Bytes>>, WebSocketError>
     where
-        P: Send + 'static
+        M: Send + 'static,
+        R: Send + 'static
 {
     let headers = req.headers();
     let ip = get_peer_ip(headers, peer.ip());
@@ -227,9 +230,10 @@ async fn upgrade<'a, P>(
     Ok(response)
 }
 
-pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'static, P>>)
+pub async fn serve<'a, M, R>(port: u16, callback: UnboundedSender<Peer<'static, M, R>>)
     where
-        P: Send + 'static
+        M: Send + 'static,
+        R: Send + 'static
 {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     let listener = TcpListener::bind(&address).await.expect("Failed to bind to port");
@@ -249,12 +253,12 @@ pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'stati
     }
 }
 
-pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
+pub async fn connect<'a, M, R>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<R>, PacketSender<M>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
     let request = ConnectionRequest::new(url);
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
         let (rx, tx) = ws.split(tokio::io::split);
-        let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx);
+        let (receiver, sender, worker) = create_channels::<'a, _, M, R>(rx, tx);
 
         let _ = callback.send(Connection::Established(true));
 
@@ -345,7 +349,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
     }
 }
 
-pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
+pub fn create_channels<'a, T, M, R>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, R>, PacketSender<M>, impl Future<Output=Reconnect<'a>> + 'a)
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
