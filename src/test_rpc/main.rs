@@ -3,13 +3,9 @@ use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use sqwerk::{rpc, serve};
+use sqwerk::rpc::RPC;
 
 const BUFFER_SIZE: usize = 10;
-
-pub trait RPC {
-    // type ClientPacket = Packet<server::Message, client::Response>;
-    // type ServerPacket = Packet<client::Message, server::Response>;
-}
 
 rpc! {
     pub trait Client {
@@ -20,7 +16,7 @@ rpc! {
 rpc! {
     pub trait Server {
         fn connect() -> ();
-        fn login(login: String, password: String) -> ();
+        fn login(login: String, password: String) -> String;
     }
 }
 
@@ -54,7 +50,7 @@ async fn main() {
 
         loop {
             if let Some((message, listener)) = s_rx.recv().await {
-                message.handle_by(&mut Handler {}, listener).await?;
+                message.handle_by(Handler {}, listener).await;
             } else {
                 break;
             }

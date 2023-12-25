@@ -23,6 +23,7 @@ use tokio::time::interval;
 use hyper::{HeaderMap, Request, Response};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
 
 pub use tokio;
 pub use hyper;
@@ -200,14 +201,14 @@ pub enum Connection {
     Disconnected,
 }
 
-async fn upgrade<'a, M, R>(
+async fn upgrade<'a, C, R>(
     mut req: Request<Incoming>,
     peer: SocketAddr,
-    callback: UnboundedSender<Peer<'static, M, R>>,
+    mut callback: C,
 ) -> Result<Response<Empty<Bytes>>, WebSocketError>
     where
-        M: Send + 'static,
-        R: Send + 'static
+        C: FnMut(WebSocket<TokioIo<Upgraded>>, IpAddr, u128) -> R + Send + 'static,
+        R: Future<Output=Reconnect<'a>> + Sized
 {
     let headers = req.headers();
     let ip = get_peer_ip(headers, peer.ip());
@@ -216,14 +217,7 @@ async fn upgrade<'a, M, R>(
 
     tokio::spawn(async move {
         let ws = upgrade.await.expect("fail");
-        let (rx, tx) = ws.split(tokio::io::split);
-        let (rx, tx, worker) = create_channels(rx, tx);
-        callback.send(Peer {
-            ip,
-            token,
-            rx,
-            tx,
-        }).unwrap();
+        let worker = callback(ws, ip, token);
         worker.await;
     });
 
@@ -244,7 +238,20 @@ pub async fn serve<'a, M, R>(port: u16, callback: UnboundedSender<Peer<'static, 
 
         let io = TokioIo::new(stream);
         let fut = hyper::server::conn::http1::Builder::new()
-            .serve_connection(io, service_fn(move |req| upgrade(req, peer, callback.clone())))
+            .serve_connection(io, service_fn(move |req| {
+                let callback = callback.clone();
+                upgrade(req, peer, move |ws, ip, token| {
+                    let (rx, tx) = ws.split(tokio::io::split);
+                    let (rx, tx, worker) = create_channels(rx, tx);
+                    callback.send(Peer {
+                        ip,
+                        token,
+                        rx,
+                        tx,
+                    }).unwrap();
+                    worker
+                })
+            }))
             .with_upgrades();
 
         if let Err(e) = fut.await {
@@ -253,12 +260,12 @@ pub async fn serve<'a, M, R>(port: u16, callback: UnboundedSender<Peer<'static, 
     }
 }
 
-pub async fn connect<'a, M, R>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<R>, PacketSender<M>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
+pub async fn connect<'a, In, Out>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<In>, PacketSender<Out>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
     let request = ConnectionRequest::new(url);
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
         let (rx, tx) = ws.split(tokio::io::split);
-        let (receiver, sender, worker) = create_channels::<'a, _, M, R>(rx, tx);
+        let (receiver, sender, worker) = create_channels::<'a, _, In, Out>(rx, tx);
 
         let _ = callback.send(Connection::Established(true));
 
@@ -349,7 +356,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
     }
 }
 
-pub fn create_channels<'a, T, M, R>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, R>, PacketSender<M>, impl Future<Output=Reconnect<'a>> + 'a)
+pub fn create_channels<'a, T, In, Out>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, In>, PacketSender<Out>, impl Future<Output=Reconnect<'a>> + 'a)
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
