@@ -1,8 +1,8 @@
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU16;
 use std::time::Duration;
 
 use base64::Engine;
@@ -59,11 +59,13 @@ pub enum SendError {
 
 #[derive(Error, Debug)]
 pub enum RecvError {
-    #[error("deserialization failed")]
+    #[error("deserialization failed: {0}")]
     Deserialize(bincode::Error, Vec<u8>),
-    #[error("channel closed")]
-    ChannelClosed(u16),
-    #[error("websocket error")]
+    #[error("disconnected")]
+    Disconnected,
+    #[error("channel closed: {1} ({0})")]
+    ChannelClosed(u16, String),
+    #[error("websocket error: {0}")]
     WebSocket(#[from] WebSocketError),
 }
 
@@ -92,26 +94,25 @@ impl<P> PacketSender<P> where P: Serialize + Debug + Send {
         self.channel.send(Ok(Frame::binary(payload))).map_err(|_| SendError::ChannelClosed)
     }
 
-    pub fn close(&self, code: u16, msg: &P) -> Result<(), SendError> {
-        let serialized = bincode::serialize(msg)?;
-        self.channel.send(Ok(Frame::close(code, &serialized))).map_err(|_| SendError::ChannelClosed)
+    pub fn close(&self, code: u16, reason: &str) -> Result<(), SendError> {
+        self.channel.send(Ok(Frame::close(code, reason.as_bytes()))).map_err(|_| SendError::ChannelClosed)
     }
 }
 
 pub struct PacketReceiver<'a, P> {
     channel: Re<'a>,
-    close_code: Option<NonZeroU16>,
+    close_code: Option<(u16, String)>,
     _ty: PhantomData<P>,
 }
 
 impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
-    pub fn get_close_code(&self) -> Option<NonZeroU16> {
-        self.close_code
+    pub fn get_close_code(&self) -> &Option<(u16, String)> {
+        &self.close_code
     }
 
     pub async fn recv(&mut self) -> Result<Option<P>, RecvError> {
-        if let Some(code) = self.close_code.as_ref() {
-            return Err(RecvError::ChannelClosed(code.get()));
+        if let Some(code) = self.close_code.clone() {
+            return Err(RecvError::ChannelClosed(code.0, code.1));
         }
         if let Some(result) = self.channel.recv().await {
             self.process(result)
@@ -121,15 +122,15 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
     }
 
     pub fn try_recv(&mut self) -> Result<Option<P>, RecvError> {
-        if let Some(code) = self.close_code.as_ref() {
-            return Err(RecvError::ChannelClosed(code.get()));
+        if let Some(code) = self.close_code.clone() {
+            return Err(RecvError::ChannelClosed(code.0, code.1));
         }
         match self.channel.try_recv() {
             Ok(command) => {
                 self.process(command)
             }
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(RecvError::ChannelClosed(0))
+            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected)
         }
     }
 
@@ -137,18 +138,24 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
         match result {
             Ok(frame) => {
                 let mut payload = &*frame.payload;
-                if frame.opcode == OpCode::Close {
-                    self.close_code = NonZeroU16::new(u16::from_be_bytes([payload[0], payload[1]]));
-                    payload = &payload[2..];
-                }
                 Ok(match frame.opcode {
-                    OpCode::Text | OpCode::Binary | OpCode::Close => {
-                        match bincode::deserialize::<P>(payload) {
+                    OpCode::Close => {
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        payload = &payload[2..];
+                        let reason = match String::from_utf8_lossy(payload) {
+                            Cow::Borrowed(unchanged) => unchanged.to_owned(),
+                            Cow::Owned(damaged) => damaged
+                        };
+                        self.close_code = Some((code, reason.clone()));
+                        return Err(RecvError::ChannelClosed(code, reason));
+                    }
+                    OpCode::Text | OpCode::Binary => {
+                        match bincode::deserialize::<P>(&*frame.payload) {
                             Ok(message) => {
                                 Some(message)
                             }
                             Err(de) => {
-                                return Err(RecvError::Deserialize(de, payload.to_vec()))
+                                return Err(RecvError::Deserialize(de, Vec::from(frame.payload)))
                             }
                         }
                     }
