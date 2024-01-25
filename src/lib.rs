@@ -348,7 +348,6 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
         match rx.read_frame(&mut obligated_send).await {
             Ok(frame) => {
                 if let Err(_) = in_s.send(Ok(frame)) {
-                    eprintln!("Packet inbound channel closed");
                     break (in_s, out_s);
                 }
             }
