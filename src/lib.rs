@@ -2,6 +2,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 use base64::Engine;
@@ -61,7 +62,7 @@ pub enum RecvError {
     #[error("deserialization failed")]
     Deserialize(bincode::Error, Vec<u8>),
     #[error("channel closed")]
-    ChannelClosed,
+    ChannelClosed(u16),
     #[error("websocket error")]
     WebSocket(#[from] WebSocketError),
 }
@@ -99,18 +100,18 @@ impl<P> PacketSender<P> where P: Serialize + Debug + Send {
 
 pub struct PacketReceiver<'a, P> {
     channel: Re<'a>,
-    closed: bool,
+    close_code: Option<NonZeroU16>,
     _ty: PhantomData<P>,
 }
 
 impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
-    pub fn is_closed(&self) -> bool {
-        self.closed
+    pub fn get_close_code(&self) -> Option<NonZeroU16> {
+        self.close_code
     }
 
     pub async fn recv(&mut self) -> Result<Option<P>, RecvError> {
-        if self.closed {
-            return Err(RecvError::ChannelClosed);
+        if let Some(code) = self.close_code.as_ref() {
+            return Err(RecvError::ChannelClosed(code.get()));
         }
         if let Some(result) = self.channel.recv().await {
             self.process(result)
@@ -120,32 +121,34 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
     }
 
     pub fn try_recv(&mut self) -> Result<Option<P>, RecvError> {
-        if self.closed {
-            return Err(RecvError::ChannelClosed);
+        if let Some(code) = self.close_code.as_ref() {
+            return Err(RecvError::ChannelClosed(code.get()));
         }
         match self.channel.try_recv() {
             Ok(command) => {
                 self.process(command)
             }
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(RecvError::ChannelClosed)
+            Err(TryRecvError::Disconnected) => Err(RecvError::ChannelClosed(0))
         }
     }
 
     fn process(&mut self, result: Result<Frame<'a>, WebSocketError>) -> Result<Option<P>, RecvError> {
         match result {
             Ok(frame) => {
+                let mut payload = &*frame.payload;
+                if frame.opcode == OpCode::Close {
+                    self.close_code = NonZeroU16::new(u16::from_be_bytes([payload[0], payload[1]]));
+                    payload = &payload[2..];
+                }
                 Ok(match frame.opcode {
                     OpCode::Text | OpCode::Binary | OpCode::Close => {
-                        match bincode::deserialize::<P>(&*frame.payload) {
+                        match bincode::deserialize::<P>(payload) {
                             Ok(message) => {
-                                if frame.opcode == OpCode::Close {
-                                    self.closed = true
-                                }
                                 Some(message)
                             }
                             Err(de) => {
-                                return Err(RecvError::Deserialize(de, frame.payload.to_vec()))
+                                return Err(RecvError::Deserialize(de, payload.to_vec()))
                             }
                         }
                     }
@@ -359,7 +362,7 @@ pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>
 
     let recv = PacketReceiver {
         channel: in_r,
-        closed: false,
+        close_code: None,
         _ty: PhantomData,
     };
     let send = PacketSender {
