@@ -53,16 +53,16 @@ pub struct Reconnect<'a> {
 pub enum SendError {
     #[error("serialization failed")]
     Serialize(#[from] bincode::Error),
-    #[error("channel closed")]
-    ChannelClosed,
+    #[error("pipe lost")]
+    Pipe,
 }
 
 #[derive(Error, Debug)]
 pub enum RecvError {
     #[error("deserialization failed: {0}")]
     Deserialize(bincode::Error, Vec<u8>),
-    #[error("disconnected")]
-    Disconnected,
+    #[error("pipe lost")]
+    Pipe,
     #[error("channel closed: {1} ({0})")]
     ChannelClosed(u16, String),
     #[error("websocket error: {0}")]
@@ -85,17 +85,17 @@ impl<P> Clone for PacketSender<P> {
 
 impl<P> PacketSender<P> where P: Serialize + Debug + Send {
     pub fn ping(&self) -> Result<(), SendError> {
-        self.channel.send(Ok(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))).map_err(|_| SendError::Pipe)
     }
 
     pub fn send(&self, msg: &P) -> Result<(), SendError> {
         let serialized = bincode::serialize(msg)?;
         let payload = Payload::Owned(serialized);
-        self.channel.send(Ok(Frame::binary(payload))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::binary(payload))).map_err(|_| SendError::Pipe)
     }
 
     pub fn close(&self, code: u16, reason: &str) -> Result<(), SendError> {
-        self.channel.send(Ok(Frame::close(code, reason.as_bytes()))).map_err(|_| SendError::ChannelClosed)
+        self.channel.send(Ok(Frame::close(code, reason.as_bytes()))).map_err(|_| SendError::Pipe)
     }
 }
 
@@ -130,7 +130,7 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
                 self.process(command)
             }
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected)
+            Err(TryRecvError::Disconnected) => Err(RecvError::Pipe)
         }
     }
 
@@ -338,7 +338,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
 
     let mut obligated_send = |f| async {
         if let Err(_) = out_s.send(Ok(f)) {
-            Err(SendError::ChannelClosed)
+            Err(SendError::Pipe)
         } else {
             Ok(())
         }
