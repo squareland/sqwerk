@@ -337,7 +337,6 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
                 }
             }
             Err(e) => {
-                eprintln!("Recv error: {:?}", e);
                 out_s.send(Err(e)).unwrap();
                 break (in_s, out_s);
             }
