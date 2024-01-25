@@ -9,7 +9,7 @@ use base64::Engine;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, TokioIo, WebSocket, WebSocketError, WebSocketRead, WebSocketWrite};
+use fastwebsockets::{FragmentCollectorRead, Frame, OpCode, Payload, TokioIo, WebSocketError, WebSocketRead, WebSocketWrite};
 use fastwebsockets::body::Empty;
 
 use thiserror::Error;
@@ -59,7 +59,7 @@ pub enum SendError {
 #[derive(Error, Debug)]
 pub enum RecvError {
     #[error("deserialization failed")]
-    Deserialize(#[from] bincode::Error),
+    Deserialize(bincode::Error, Vec<u8>),
     #[error("channel closed")]
     ChannelClosed,
     #[error("websocket error")]
@@ -137,11 +137,17 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
             Ok(frame) => {
                 Ok(match frame.opcode {
                     OpCode::Text | OpCode::Binary | OpCode::Close => {
-                        let message = bincode::deserialize::<P>(&*frame.payload)?;
-                        if frame.opcode == OpCode::Close {
-                            self.closed = true
+                        match bincode::deserialize::<P>(&*frame.payload) {
+                            Ok(message) => {
+                                if frame.opcode == OpCode::Close {
+                                    self.closed = true
+                                }
+                                Some(message)
+                            }
+                            Err(de) => {
+                                return Err(RecvError::Deserialize(de, frame.payload.to_vec()))
+                            }
                         }
-                        Some(message)
                     }
                     _ => None
                 })
