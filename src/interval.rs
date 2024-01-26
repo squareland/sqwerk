@@ -1,23 +1,32 @@
-use tokio::time::Interval;
+use std::time::Duration;
+use tokio::time::{Instant, Interval};
 
 pub(crate) struct TimedInterval {
     interval: Interval,
     times: u32,
-    current_time: u32,
+    timeout: Option<Instant>,
 }
 
 impl TimedInterval {
     pub(crate) fn from(interval: Interval, times: u32) -> Self {
-        Self { interval, times, current_time: times }
+        Self { interval, times, timeout: None }
     }
 
     pub(crate) async fn check_expired(&mut self) -> bool {
         self.interval.tick().await;
-        self.current_time -= 1;
-        self.current_time == 0
+        if let Some(timeout) = self.timeout.as_ref() {
+            Instant::now() >= *timeout
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn begin(&mut self) {
+        let total = self.interval.period().as_secs() * self.times as u64;
+        self.timeout = Some(Instant::now() + Duration::from_secs(total));
     }
 
     pub(crate) fn reset(&mut self) {
-        self.current_time = self.times;
+        self.timeout = None;
     }
 }

@@ -279,8 +279,11 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
             let mut reconnect = worker.await;
             let mut reconnect_timeout = TimedInterval::from(interval(reconnect_in), max_tries);
 
+            reconnect_timeout.begin();
+
             loop {
                 let _ = callback.send(Connection::Reconnecting);
+
                 match fastwebsockets::handshake::connect(&request).await {
                     Err(e) => {
                         if reconnect_timeout.check_expired().await {
@@ -295,6 +298,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                         let worker = create_workers(rx, tx, reconnect);
                         let _ = callback.send(Connection::Established(false));
                         reconnect = worker.await;
+                        reconnect_timeout.begin();
                     }
                 }
             }
