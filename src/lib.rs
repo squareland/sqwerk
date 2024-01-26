@@ -212,6 +212,7 @@ pub enum Connection {
     // is primary
     Reconnecting,
     Disconnected,
+    Failed(WebSocketError),
 }
 
 async fn upgrade<'a, P>(
@@ -286,6 +287,7 @@ pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration
                             let _ = callback.send(Connection::Disconnected);
                             break e;
                         }
+                        let _ = callback.send(Connection::Failed(e));
                     }
                     Ok(ws) => {
                         let (rx, tx) = ws.split(tokio::io::split);
