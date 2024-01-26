@@ -266,8 +266,10 @@ pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'stati
     }
 }
 
-pub async fn connect<'a, P>(url: &'a str, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError> {
-    let request = ConnectionRequest::new(url);
+pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError>
+    where C: Into<ConnectionRequest>
+{
+    let request = request.into();
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
         let (rx, tx) = ws.split(tokio::io::split);

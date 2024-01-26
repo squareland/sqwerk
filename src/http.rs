@@ -4,17 +4,24 @@ use fastwebsockets::handshake::IntoClientRequest;
 use fastwebsockets::WebSocketError;
 use hyper::body::Bytes;
 use hyper::{Request, Uri};
+use rand::random;
 
 pub struct ConnectionRequest {
     url: String,
     token: u128
 }
 
+impl<S> From<S> for ConnectionRequest where S: ToString {
+    fn from(value: S) -> Self {
+        ConnectionRequest::new(value, random())
+    }
+}
+
 impl ConnectionRequest {
-    pub fn new<S>(url: S) -> Self where S: ToString {
+    pub fn new<S>(url: S, token: u128) -> Self where S: ToString {
         Self {
             url: url.to_string(),
-            token: rand::random()
+            token
         }
     }
 }
