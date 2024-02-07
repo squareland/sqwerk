@@ -239,6 +239,7 @@ async fn upgrade<'a, P>(
             tx,
         }).unwrap();
         worker.await;
+        eprintln!("Closing socket for {:08X}", token);
     });
 
     Ok(response)
