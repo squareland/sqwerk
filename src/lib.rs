@@ -239,7 +239,6 @@ async fn upgrade<'a, P>(
             tx,
         }).unwrap();
         worker.await;
-        eprintln!("Closing socket for {:08X}", token);
     });
 
     Ok(response)
@@ -329,7 +328,6 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
     loop {
         match out_r.recv().await {
             None => {
-                eprintln!("outbound channel closed");
                 let _ = tx.write_frame(Frame::close(1000, b"ack")).await;
                 break out_r;
             }
@@ -364,7 +362,6 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>, impatient: 
         match rx.read_frame(&mut obligated_send).await {
             Ok(frame) => {
                 if let Err(_) = in_s.send(Ok(frame)) {
-                    eprintln!("inbound channel closed");
                     if impatient {
                         break None;
                     }
@@ -372,7 +369,6 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>, impatient: 
                 }
             }
             Err(e) => {
-                eprintln!("inbound ws error: {:?}", e);
                 if impatient {
                     break None;
                 }
