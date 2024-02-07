@@ -231,7 +231,7 @@ async fn upgrade<'a, P>(
     tokio::spawn(async move {
         let ws = upgrade.await.expect("fail");
         let (rx, tx) = ws.split(tokio::io::split);
-        let (rx, tx, worker) = create_channels(rx, tx);
+        let (rx, tx, worker) = create_channels(rx, tx, true);
         callback.send(Peer {
             ip,
             token,
@@ -274,12 +274,12 @@ pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duratio
     let conn = fastwebsockets::handshake::connect(&request).await;
     conn.map(|ws| {
         let (rx, tx) = ws.split(tokio::io::split);
-        let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx);
+        let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx, false);
 
         let _ = callback.send(Connection::Established(true));
 
         let worker = async move {
-            let mut reconnect = worker.await;
+            let mut reconnect = worker.await.unwrap();
             let mut reconnect_timeout = TimedInterval::from(interval(reconnect_in), max_tries);
 
             reconnect_timeout.begin();
@@ -298,9 +298,9 @@ pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duratio
                     Ok(ws) => {
                         let (rx, tx) = ws.split(tokio::io::split);
                         reconnect_timeout.reset();
-                        let worker = create_workers(rx, tx, reconnect);
+                        let worker = create_workers(rx, tx, reconnect, false);
                         let _ = callback.send(Connection::Established(false));
-                        reconnect = worker.await;
+                        reconnect = worker.await.unwrap();
                         reconnect_timeout.begin();
                     }
                 }
@@ -312,14 +312,15 @@ pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duratio
 }
 
 
-pub async fn create_workers<'a, T>(rx: Rx<T>, tx: Tx<T>, Reconnect { in_s, out_r, out_s }: Reconnect<'a>) -> Reconnect<'a>
+pub async fn create_workers<'a, T>(rx: Rx<T>, tx: Tx<T>, Reconnect { in_s, out_r, out_s }: Reconnect<'a>, impatient: bool) -> Option<Reconnect<'a>>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
-    let ((in_s, out_s), out_r) = tokio::join!(
-        inbound(rx, in_s, out_s),
+    let (opt, out_r) = tokio::join!(
+        inbound(rx, in_s, out_s, impatient),
         outbound(tx, out_r)
     );
-    Reconnect { in_s, out_r, out_s }
+    let (in_s, out_s) = opt?;
+    Some(Reconnect { in_s, out_r, out_s })
 }
 
 async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
@@ -341,7 +342,7 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
 }
 
 
-async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>, Se<'static>)
+async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>, impatient: bool) -> Option<(Se<'a>, Se<'static>)>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
     let mut rx = FragmentCollectorRead::new(rx);
@@ -359,19 +360,22 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>) -> (Se<'a>,
             Ok(frame) => {
                 if let Err(_) = in_s.send(Ok(frame)) {
                     eprintln!("inbound channel closed");
-                    break (in_s, out_s);
+                    if impatient {
+                        break None;
+                    }
+                    break Some((in_s, out_s));
                 }
             }
             Err(e) => {
                 eprintln!("inbound ws error: {:?}", e);
                 out_s.send(Err(e)).unwrap();
-                break (in_s, out_s);
+                break Some((in_s, out_s));
             }
         }
     }
 }
 
-pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Reconnect<'a>> + 'a)
+pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>, impatient: bool) -> (PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=Option<Reconnect<'a>>> + 'a)
     where
         T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
@@ -390,7 +394,7 @@ pub fn create_channels<'a, T, P>(rx: Rx<T>, tx: Tx<T>) -> (PacketReceiver<'a, P>
 
     let reconnect = Reconnect { in_s, out_r, out_s };
 
-    let worker = create_workers(rx, tx, reconnect);
+    let worker = create_workers(rx, tx, reconnect, impatient);
 
     (recv, send, worker)
 }
