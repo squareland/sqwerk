@@ -373,6 +373,9 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>, impatient: 
             }
             Err(e) => {
                 eprintln!("inbound ws error: {:?}", e);
+                if impatient {
+                    break None;
+                }
                 out_s.send(Err(e)).unwrap();
                 break Some((in_s, out_s));
             }
