@@ -327,17 +327,22 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
     loop {
-        if let Some(command) = out_r.recv().await {
-            if let Ok(frame) = command {
-                if let Err(e) = tx.write_frame(frame).await {
-                    eprintln!("Send error: {:?}", e);
-                } else {
-                    continue;
+        match out_r.recv().await {
+            None => {
+                eprintln!("outbound channel closed");
+                let _ = tx.write_frame(Frame::close(1000, b"ack")).await;
+                break out_r;
+            }
+            Some(command) => {
+                if let Ok(frame) = command {
+                    if let Err(e) = tx.write_frame(frame).await {
+                        eprintln!("Send error: {:?}", e);
+                    } else {
+                        continue;
+                    }
                 }
             }
         }
-        eprintln!("outbound closed");
-        break out_r;
     }
 }
 
