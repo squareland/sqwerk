@@ -335,6 +335,12 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
                 if let Ok(frame) = command {
                     if let Err(e) = tx.write_frame(frame).await {
                         eprintln!("Send error: {:?}", e);
+                        match e {
+                            WebSocketError::IoError(e) if e.kind() == std::io::ErrorKind::ConnectionAborted  => {
+                                break out_r;
+                            }
+                            _ => {}
+                        }
                     } else {
                         continue;
                     }
