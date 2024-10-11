@@ -244,11 +244,11 @@ async fn upgrade<'a, P>(
     Ok(response)
 }
 
-pub async fn serve<'a, P: Send>(port: u16, callback: UnboundedSender<Peer<'static, P>>)
+pub async fn serve<'a, P: Send>(addr: IpAddr, port: u16, callback: UnboundedSender<Peer<'static, P>>)
     where
         P: Send + 'static
 {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let address = SocketAddr::new(addr, port);
     let listener = TcpListener::bind(&address).await.expect("Failed to bind to port");
 
     loop {
