@@ -325,6 +325,14 @@ pub async fn create_workers<'a, T>(rx: Rx<T>, tx: Tx<T>, Reconnect { in_s, out_r
 async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
+    fn should_reconnect(e: std::io::ErrorKind) -> bool {
+        match e {
+            std::io::ErrorKind::ConnectionAborted => true,
+            std::io::ErrorKind::ConnectionReset => true,
+            _ => false,
+        }
+    }
+
     loop {
         match out_r.recv().await {
             None => {
@@ -336,7 +344,7 @@ async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
                     if let Err(e) = tx.write_frame(frame).await {
                         eprintln!("Send error: {:?}", e);
                         match e {
-                            WebSocketError::IoError(e) if e.kind() == std::io::ErrorKind::ConnectionAborted  => {
+                            WebSocketError::IoError(e) if should_reconnect(e.kind())  => {
                                 break out_r;
                             }
                             _ => {}
