@@ -37,6 +37,9 @@ mod interval;
 use http::ConnectionRequest;
 use interval::TimedInterval;
 
+const X_REAL_IP_HEADER: &'static str = "x-real-ip";
+const SEC_WEBSOCKET_KEY_HEADER: &'static str = "sec-websocket-key";
+
 type Re<'a> = UnboundedReceiver<Result<Frame<'a>, WebSocketError>>;
 type Se<'a> = UnboundedSender<Result<Frame<'a>, WebSocketError>>;
 
@@ -168,7 +171,7 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
 }
 
 fn get_peer_ip(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
-    if let Some(header) = headers.get("x-real-ip") {
+    if let Some(header) = headers.get(X_REAL_IP_HEADER) {
         if let Ok(s) = std::str::from_utf8(header.as_ref()) {
             if let Ok(ip) = s.parse::<IpAddr>() {
                 return ip;
@@ -179,7 +182,7 @@ fn get_peer_ip(headers: &HeaderMap, fallback: IpAddr) -> IpAddr {
 }
 
 fn get_peer_token(headers: &HeaderMap) -> Result<u128, WebSocketError> {
-    if let Some(header) = headers.get("sec-websocket-key") {
+    if let Some(header) = headers.get(SEC_WEBSOCKET_KEY_HEADER) {
         if let Ok(s) = std::str::from_utf8(header.as_ref()) {
             return decode_token(s);
         }
@@ -208,8 +211,7 @@ pub struct Peer<'a, P> {
 }
 
 pub enum Connection {
-    Established(bool),
-    // is primary
+    Established(/*is_primary*/bool),
     Reconnecting,
     Disconnected,
     Failed(WebSocketError),
@@ -325,34 +327,21 @@ pub async fn create_workers<'a, T>(rx: Rx<T>, tx: Tx<T>, Reconnect { in_s, out_r
 async fn outbound<'a, T>(mut tx: Tx<T>, mut out_r: Re<'static>) -> Re<'static>
     where T: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'a
 {
-    fn should_reconnect(e: std::io::ErrorKind) -> bool {
-        match e {
-            std::io::ErrorKind::ConnectionAborted => true,
-            std::io::ErrorKind::ConnectionReset => true,
-            _ => false,
-        }
-    }
-
     loop {
         match out_r.recv().await {
             None => {
                 let _ = tx.write_frame(Frame::close(1000, b"ack")).await;
                 break out_r;
             }
-            Some(command) => {
-                if let Ok(frame) = command {
-                    if let Err(e) = tx.write_frame(frame).await {
-                        eprintln!("Send error: {:?}", e);
-                        match e {
-                            WebSocketError::IoError(e) if should_reconnect(e.kind())  => {
-                                break out_r;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        continue;
-                    }
+            Some(Ok(frame)) => {
+                if let Err(e) = tx.write_frame(frame).await {
+                    eprintln!("Send error: {:?}", e);
+                    break out_r;
                 }
+            }
+            Some(Err(e)) => {
+                eprintln!("Outbound terminating due to inbound error: {:?}", e);
+                break out_r;
             }
         }
     }
@@ -386,7 +375,7 @@ async fn inbound<'a, T>(rx: Rx<T>, in_s: Se<'a>, out_s: Se<'static>, impatient: 
                 if impatient {
                     break None;
                 }
-                out_s.send(Err(e)).unwrap();
+                let _ = out_s.send(Err(e));
                 break Some((in_s, out_s));
             }
         }
