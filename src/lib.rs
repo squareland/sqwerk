@@ -266,11 +266,11 @@ pub async fn serve<'a, P: Send>(addr: IpAddr, port: u16, callback: UnboundedSend
     }
 }
 
-pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError>
+pub async fn connect<'a, 'b: 'a, P, C>(request: C, sni: Option<&'b str>, max_tries: u32, reconnect_in: Duration, callback: UnboundedSender<Connection>) -> Result<(PacketReceiver<'a, P>, PacketSender<P>, impl Future<Output=WebSocketError> + 'a), WebSocketError>
     where C: Into<ConnectionRequest>
 {
     let request = request.into();
-    let conn = fastwebsockets::handshake::connect(&request).await;
+    let conn = fastwebsockets::handshake::connect(&request, sni).await;
     conn.map(|ws| {
         let (rx, tx) = ws.split(tokio::io::split);
         let (receiver, sender, worker) = create_channels::<'a, _, P>(rx, tx, false);
@@ -286,7 +286,7 @@ pub async fn connect<'a, P, C>(request: C, max_tries: u32, reconnect_in: Duratio
             loop {
                 let _ = callback.send(Connection::Reconnecting);
 
-                match fastwebsockets::handshake::connect(&request).await {
+                match fastwebsockets::handshake::connect(&request, sni).await {
                     Err(e) => {
                         if reconnect_timeout.check_expired().await {
                             let _ = callback.send(Connection::Disconnected);
