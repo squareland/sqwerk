@@ -135,16 +135,19 @@ impl<'a, P> PacketReceiver<'a, P> where P: DeserializeOwned + Debug + Send {
     }
 
     fn process(&mut self, result: Result<Frame<'a>, WebSocketError>) -> Result<Option<P>, RecvError> {
+        const CLOSE_NO_STATUS: u16 = 1005;
+
         match result {
             Ok(frame) => {
-                let mut payload = &*frame.payload;
+                let payload = &*frame.payload;
                 Ok(match frame.opcode {
                     OpCode::Close => {
-                        let code = u16::from_be_bytes([payload[0], payload[1]]);
-                        payload = &payload[2..];
-                        let reason = match String::from_utf8_lossy(payload) {
-                            Cow::Borrowed(unchanged) => unchanged.to_owned(),
-                            Cow::Owned(damaged) => damaged
+                        let (code, reason) = if payload.len() >= 2 {
+                            let code = u16::from_be_bytes([payload[0], payload[1]]);
+                            let reason = String::from_utf8_lossy(&payload[2..]).into_owned();
+                            (code, reason)
+                        } else {
+                            (CLOSE_NO_STATUS, String::new())
                         };
                         self.close_code = Some((code, reason.clone()));
                         return Err(RecvError::ChannelClosed(code, reason));
